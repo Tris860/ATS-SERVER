@@ -1,0 +1,27 @@
+{
+  "dependencies": {
+    "node-fetch": "^3.3.2",
+    "ws": "^8.18.3"
+  },
+  "name": "ats-server",
+  "version": "1.0.0",
+  "description": "",
+  "main": "server.js",
+  "devDependencies": {},
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Tris860/ATS-SERVER.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/Tris860/ATS-SERVER/issues"
+  },
+  "homepage": "https://github.com/Tris860/ATS-SERVER#readme"
+}
