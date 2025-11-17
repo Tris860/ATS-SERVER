@@ -193,7 +193,7 @@ async function authenticateAndUpgradeWemos(request, socket, head, usernameHeader
       socket.destroy();
       return;
     }
-    console.log(data);
+    console.log(data.message);
     // deviceName is authoritative label for the physical device
     const deviceName = data.data?.device_name || usernameHeader;
     const initialCommand = data.data?.hard_switch_enabled ? 'HARD_ON' : 'HARD_OFF';
@@ -209,10 +209,11 @@ async function authenticateAndUpgradeWemos(request, socket, head, usernameHeader
         // If there's an existing Wemos connection for same deviceName, terminate it
         const existing = authenticatedWemos.get(deviceName);
         if (existing && existing.readyState === WebSocket.OPEN) {
-          try { existing.terminate(); } catch (e) {}
+          try { existing.terminate();console.log(`Terminated existing Wemos connection for ${deviceName}`); } catch (e) { console.log(`Error terminating existing Wemos connection for ${deviceName}: ${e.message}`); }
         }
 
         authenticatedWemos.set(deviceName, ws);
+        console.log(`Wemos '${deviceName}' authenticated and connected.`);
         log(`Wemos '${deviceName}' authenticated and connected.`);
 
         // enqueue initial command so it will be flushed once client is ready
@@ -227,6 +228,7 @@ async function authenticateAndUpgradeWemos(request, socket, head, usernameHeader
         wss.emit('connection', ws, request);
       });
     } catch (err) {
+      console.log(`handleUpgrade error: ${err.message}`);
       log(`handleUpgrade error: ${err.message}`);
       safeSocketWrite(socket, 'HTTP/1.1 500 Internal Server Error\r\n\r\n');
       socket.destroy();
