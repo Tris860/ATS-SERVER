@@ -232,7 +232,7 @@ async function authenticateAndUpgradeWemos(request, socket, head, usernameHeader
         // flush queued messages
         flushQueue(ws);
 
-        // wss.emit('connection', ws, request);
+        wss.emit('connection', ws, request);
       });
     } catch (err) {
       console.log(`handleUpgrade error: ${err.message}`);
