@@ -213,7 +213,8 @@ async function authenticateAndUpgradeWemos(request, socket, head, usernameHeader
             setTimeout(() => {
               try { 
                 existing.close(1000, "New Wemos session replacing old");
-                } catch (e) {}
+                console.log("Gracefully closed existing Wemos connection.");
+                } catch (e) {console.log(e);}
             }, 500); // allow handshake to complete
        }
 
