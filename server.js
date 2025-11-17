@@ -193,7 +193,7 @@ async function authenticateAndUpgradeWemos(request, socket, head, usernameHeader
       socket.destroy();
       return;
     }
-
+    console.log(data);
     // deviceName is authoritative label for the physical device
     const deviceName = data.data?.device_name || usernameHeader;
     const initialCommand = data.data?.hard_switch_enabled ? 'HARD_ON' : 'HARD_OFF';
