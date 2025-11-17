@@ -218,21 +218,20 @@ async function authenticateAndUpgradeWemos(request, socket, head, usernameHeader
             }, 500); // allow handshake to complete
        }
 
-
+        console.log(`Wemos '${deviceName}' authenticated successfully.`);
         authenticatedWemos.set(deviceName, ws);
         console.log(`Wemos '${deviceName}' authenticated and connected.`);
         log(`Wemos '${deviceName}' authenticated and connected.`);
 
         // enqueue initial command so it will be flushed once client is ready
         if (initialCommand) enqueueForDevice(deviceName, initialCommand);
-
-        // notify web clients mapped to this device that it's connected
-        notifyDeviceStatusToWebClients(deviceName, 'CONNECTED');
-
+         notifyDeviceStatusToWebClients(deviceName, 'CONNECTED');
+        console.log(`Notified web clients that Wemos '${deviceName}' is connected.`);
         // flush queued messages
         flushQueue(ws);
-
+        console.log(`Flushed queued messages to Wemos '${deviceName}'.`);
         wss.emit('connection', ws, request);
+        console.log(`Wemos '${deviceName}' connection upgrade complete.`);
       });
     } catch (err) {
       console.log(`handleUpgrade error: ${err.message}`);
@@ -366,6 +365,7 @@ wss.on('connection', (ws, request) => {
         try { ws.send('WEMOS_STATUS:DISCONNECTED'); } catch (e) {}
       }
     } else {
+    console.log(`Received from Wemos '${ws.wemosName}': ${text}`);
       // Wemos -> server messages
       const fromDevice = ws.wemosName;
       if (text === "WEMOS_READY") {
