@@ -1,10 +1,24 @@
-// server.js
+// server.js (hardened)
+/* eslint-disable no-console */
 const http = require('http');
 const os = require('os');
 const url = require('url');
-
 const WebSocket = require('ws');
-// const fetch = require('node-fetch');
+
+// === FETCH SAFETY (use global fetch when available, otherwise try node-fetch) ===
+let fetchFn = global.fetch;
+if (!fetchFn) {
+  try {
+    // try commonjs node-fetch v2 fallback
+    // if your environment only supports node-fetch v3 (ESM) this will fail;
+    // however Render / modern Node usually has global fetch.
+    // Keep this in try/catch to avoid crashing.
+    fetchFn = require('node-fetch');
+  } catch (e) {
+    console.warn('fetch not available and node-fetch not found; remote calls will fail unless Node provides fetch');
+    fetchFn = undefined;
+  }
+}
 
 // === CONFIG (use env vars on Render) ===
 const PORT = process.env.PORT || 4000;
@@ -25,23 +39,62 @@ function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
+function safeSocketWrite(socket, payload) {
+  try {
+    socket.write(payload);
+  } catch (e) {
+    // ignore; socket may be already closed
+  }
+}
+
+function normalizeHeader(h) {
+  if (!h) return null;
+  if (Array.isArray(h)) {
+    // prefer first non-empty
+    for (const v of h) {
+      if (v && v.toString().trim()) return v.toString().trim();
+    }
+    return null;
+  }
+  // header might be comma separated string when duplicates exist
+  if (typeof h === 'string') {
+    const parts = h.split(',');
+    return parts.length ? parts[0].trim() : h.trim();
+  }
+  return String(h);
+}
+
 function enqueueForDevice(deviceName, msg) {
-  let q = pendingQueues.get(deviceName) || [];
+  if (!deviceName) return;
+  const q = pendingQueues.get(deviceName) || [];
   q.push(msg);
   pendingQueues.set(deviceName, q);
 }
 
 function flushQueue(ws) {
+  if (!ws || !ws.wemosName) return;
   const deviceName = ws.wemosName;
   const q = pendingQueues.get(deviceName) || [];
   pendingQueues.delete(deviceName);
+  let sent = 0;
   q.forEach(m => {
-    try { ws.send(m); } catch (e) {}
+    try {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(m);
+        sent++;
+      } else {
+        // re-enqueue if not open
+        enqueueForDevice(deviceName, m);
+      }
+    } catch (e) {
+      // ignore single send errors
+      enqueueForDevice(deviceName, m);
+    }
   });
-  if (q.length > 0) log(`Flushed ${q.length} queued messages to ${deviceName}`);
+  if (sent > 0) log(`Flushed ${sent} queued messages to ${deviceName}`);
 }
 
-// === SERVER ===
+// === HTTP SERVER & UPGRADE HANDLING ===
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('WebSocket server running\n');
@@ -51,12 +104,20 @@ server.on('upgrade', async (request, socket, head) => {
   const parsed = url.parse(request.url, true);
   const webUserQuery = parsed.query.user || null;
 
-  const xUsername = request.headers['x-username'];
-  const xPassword = request.headers['x-password'];
+  const rawUsername = request.headers['x-username'];
+  const rawPassword = request.headers['x-password'];
 
+  const xUsername = normalizeHeader(rawUsername);
+  const xPassword = normalizeHeader(rawPassword);
+
+  // If the client sent auth headers, treat as Wemos device
   if (xUsername && xPassword) {
-    await authenticateAndUpgradeWemos(request, socket, head);
-  } else {
+    await authenticateAndUpgradeWemos(request, socket, head, xUsername, xPassword);
+    return;
+  }
+
+  // Otherwise treat as a regular browser/web client
+  try {
     wss.handleUpgrade(request, socket, head, (ws) => {
       ws.isWemos = false;
       ws.webUsername = webUserQuery;
@@ -65,17 +126,26 @@ server.on('upgrade', async (request, socket, head) => {
       log(`Webpage client connected. user=${ws.webUsername || '[unknown]'}`);
       wss.emit('connection', ws, request);
     });
+  } catch (err) {
+    log(`Upgrade error for webpage client: ${err.message}`);
+    safeSocketWrite(socket, 'HTTP/1.1 400 Bad Request\r\n\r\n');
+    socket.destroy();
   }
 });
 
 // === AUTHENTICATE WEMOS ===
-async function authenticateAndUpgradeWemos(request, socket, head) {
-  const usernameHeader = request.headers['x-username'];
-  const passwordHeader = request.headers['x-password'];
+async function authenticateAndUpgradeWemos(request, socket, head, usernameHeader, passwordHeader) {
   log(`Authenticating Wemos. username=${usernameHeader}`);
 
   if (!usernameHeader || !passwordHeader) {
-    socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+    safeSocketWrite(socket, 'HTTP/1.1 400 Bad Request\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  if (!fetchFn) {
+    log('ERROR: fetch not available in this Node runtime');
+    safeSocketWrite(socket, 'HTTP/1.1 500 Internal Server Error\r\n\r\n');
     socket.destroy();
     return;
   }
@@ -86,60 +156,98 @@ async function authenticateAndUpgradeWemos(request, socket, head) {
     postData.append('username', usernameHeader);
     postData.append('password', passwordHeader);
 
-    const resp = await fetch(WEMOS_AUTH_URL, {
+    const resp = await fetchFn(WEMOS_AUTH_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: postData.toString()
     });
 
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = await resp.json();
-
-    if (data.success !== true) {
-      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+    if (!resp.ok) {
+      log(`Wemos auth HTTP error: ${resp.status} ${resp.statusText || ''}`);
+      safeSocketWrite(socket, 'HTTP/1.1 401 Unauthorized\r\n\r\n');
       socket.destroy();
-      log(`Wemos auth failed: ${data.message || 'invalid'}`);
       return;
     }
 
+    // try to parse JSON, but be defensive
+    let data = null;
+    const ct = resp.headers.get ? resp.headers.get('content-type') || '' : '';
+    if (ct.includes('application/json')) {
+      data = await resp.json();
+    } else {
+      const raw = await resp.text();
+      log(`WEMOS AUTH RAW RESPONSE: ${raw.slice(0, 1000)}`); // log up to 1000 chars
+      try {
+        data = JSON.parse(raw);
+      } catch (e) {
+        log('Wemos auth returned non-json response; rejecting auth');
+        safeSocketWrite(socket, 'HTTP/1.1 502 Bad Gateway\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+    }
+
+    if (!data || data.success !== true) {
+      log(`Wemos auth failed: ${data && data.message ? data.message : 'invalid credentials'}`);
+      safeSocketWrite(socket, 'HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
+    // deviceName is authoritative label for the physical device
     const deviceName = data.data?.device_name || usernameHeader;
     const initialCommand = data.data?.hard_switch_enabled ? 'HARD_ON' : 'HARD_OFF';
 
-    log(`Wemos '${deviceName}' TLS handshake started`);
-    wss.handleUpgrade(request, socket, head, (ws) => {
-      ws.isWemos = true;
-      ws.wemosName = deviceName;
-      ws.isAlive = true;
-      ws.connectTime = Date.now();
+    // Proceed with WS upgrade
+    try {
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        ws.isWemos = true;
+        ws.wemosName = deviceName;
+        ws.isAlive = true;
+        ws.connectTime = Date.now();
 
-      const existing = authenticatedWemos.get(deviceName);
-      if (existing && existing.readyState === WebSocket.OPEN) {
-        existing.terminate();
-      }
+        // If there's an existing Wemos connection for same deviceName, terminate it
+        const existing = authenticatedWemos.get(deviceName);
+        if (existing && existing.readyState === WebSocket.OPEN) {
+          try { existing.terminate(); } catch (e) {}
+        }
 
-      authenticatedWemos.set(deviceName, ws);
-      log(`Wemos '${deviceName}' authenticated and CONNECTED`);
+        authenticatedWemos.set(deviceName, ws);
+        log(`Wemos '${deviceName}' authenticated and connected.`);
 
-      if (initialCommand) enqueueForDevice(deviceName, initialCommand);
-      flushQueue(ws);
+        // enqueue initial command so it will be flushed once client is ready
+        if (initialCommand) enqueueForDevice(deviceName, initialCommand);
 
-      notifyDeviceStatusToWebClients(deviceName, 'CONNECTED');
-      wss.emit('connection', ws, request);
-    });
+        // notify web clients mapped to this device that it's connected
+        notifyDeviceStatusToWebClients(deviceName, 'CONNECTED');
+
+        // flush queued messages
+        flushQueue(ws);
+
+        wss.emit('connection', ws, request);
+      });
+    } catch (err) {
+      log(`handleUpgrade error: ${err.message}`);
+      safeSocketWrite(socket, 'HTTP/1.1 500 Internal Server Error\r\n\r\n');
+      socket.destroy();
+    }
 
   } catch (err) {
     log(`Wemos auth error: ${err.message}`);
-    socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
+    safeSocketWrite(socket, 'HTTP/1.1 500 Internal Server Error\r\n\r\n');
     socket.destroy();
   }
 }
 
-// === HELPERS ===
+// === HELPERS FOR WEB CLIENT MANAGEMENT ===
 function addWebClientForUser(email, ws) {
   if (!email) return;
-  let set = userWebClients.get(email) || new Set();
+  let set = userWebClients.get(email);
+  if (!set) {
+    set = new Set();
+    userWebClients.set(email, set);
+  }
   set.add(ws);
-  userWebClients.set(email, set);
 }
 
 function removeWebClientForUser(email, ws) {
@@ -151,12 +259,16 @@ function removeWebClientForUser(email, ws) {
 
 function notifyDeviceStatusToWebClients(deviceName, status) {
   userWebClients.forEach((set, email) => {
-    if (userToWemosCache.get(email) === deviceName) {
-      set.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) {
-          try { client.send(`WEMOS_STATUS:${status}`); } catch (e) {}
-        }
-      });
+    try {
+      if (userToWemosCache.get(email) === deviceName) {
+        set.forEach(client => {
+          if (client.readyState === WebSocket.OPEN) {
+            try { client.send(`WEMOS_STATUS:${status}`); } catch (e) {}
+          }
+        });
+      }
+    } catch (e) {
+      // continue on any per-user error
     }
   });
 }
@@ -165,19 +277,24 @@ async function getCachedWemosDeviceNameForUser(userEmail) {
   if (!userEmail) return null;
   if (userToWemosCache.has(userEmail)) return userToWemosCache.get(userEmail);
 
+  if (!fetchFn) {
+    log('fetch unavailable, cannot lookup user device');
+    return null;
+  }
+
   const postData = new URLSearchParams();
   postData.append('action', 'get_user_device');
   postData.append('email', userEmail);
 
   try {
-    const resp = await fetch(USER_DEVICE_LOOKUP_URL, {
+    const resp = await fetchFn(USER_DEVICE_LOOKUP_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: postData.toString()
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
-    if (data.success && data.device_name) {
+    if (data && data.success && data.device_name) {
       userToWemosCache.set(userEmail, data.device_name);
       return data.device_name;
     }
@@ -200,6 +317,8 @@ wss.on('connection', (ws, request) => {
         ws.assignedWemosName = deviceName;
         const status = (deviceName && authenticatedWemos.get(deviceName)?.readyState === WebSocket.OPEN) ? 'CONNECTED' : 'DISCONNECTED';
         try { ws.send(`WEMOS_STATUS:${status}`); } catch (e) {}
+      }).catch(err => {
+        try { ws.send('WEMOS_STATUS:DISCONNECTED'); } catch (e) {}
       });
     } else {
       try { ws.send('WEMOS_STATUS:DISCONNECTED'); } catch (e) {}
@@ -219,7 +338,10 @@ wss.on('connection', (ws, request) => {
         ws.assignedWemosName = deviceName;
       }
 
-      if (!deviceName) return;
+      if (!deviceName) {
+        try { ws.send('MESSAGE_FAILED:NoDeviceAssigned'); } catch (e) {}
+        return;
+      }
 
       const target = authenticatedWemos.get(deviceName);
       if (target && target.readyState === WebSocket.OPEN) {
@@ -227,7 +349,7 @@ wss.on('connection', (ws, request) => {
         if (age < 8000) {
           enqueueForDevice(deviceName, text);
         } else {
-          try { target.send(text); } catch (e) {}
+          try { target.send(text); } catch (e) { enqueueForDevice(deviceName, text); }
         }
         try { ws.send('MESSAGE_DELIVERED'); } catch (e) {}
       } else {
@@ -235,6 +357,7 @@ wss.on('connection', (ws, request) => {
         try { ws.send('WEMOS_STATUS:DISCONNECTED'); } catch (e) {}
       }
     } else {
+      // Wemos -> server messages
       const fromDevice = ws.wemosName;
       if (text === "WEMOS_READY") {
         flushQueue(ws);
@@ -264,11 +387,13 @@ wss.on('connection', (ws, request) => {
       if (email) {
         removeWebClientForUser(email, ws);
         log(`Webpage client disconnected. user=${email}`);
+      } else {
+        log('Webpage client disconnected. user=[unknown]');
       }
     }
   });
 
-  ws.on('error', (err) => log(`WebSocket error: ${err.message}`));
+  ws.on('error', (err) => log(`WebSocket error: ${err && err.message ? err.message : JSON.stringify(err)}`));
 });
 
 // === HEARTBEAT ===
@@ -276,18 +401,19 @@ setInterval(() => {
   wss.clients.forEach(ws => {
     if (ws.isAlive === false) return ws.terminate();
     ws.isAlive = false;
-    ws.ping();
+    try { ws.ping(); } catch (e) {}
   });
 }, 30000);
 
 // === PERIODIC PHP CHECK ===
 async function checkPhpBackend() {
+  if (!fetchFn) return;
   try {
-    const resp = await fetch(PHP_BACKEND_URL);
+    const resp = await fetchFn(PHP_BACKEND_URL);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
 
-    if (data.success === true) {
+    if (data && data.success === true) {
       const messageToWemos = 'AUTO_ON';
       const messageToWeb = `TIME_MATCHED: ${data.message}: ${data.id}`;
 
@@ -297,7 +423,7 @@ async function checkPhpBackend() {
           if (age < 8000) {
             enqueueForDevice(deviceName, messageToWemos);
           } else {
-            try { client.send(messageToWemos); } catch (e) {}
+            try { client.send(messageToWemos); } catch (e) { enqueueForDevice(deviceName, messageToWemos); }
           }
         } else {
           enqueueForDevice(deviceName, messageToWemos);
