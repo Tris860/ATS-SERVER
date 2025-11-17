@@ -208,15 +208,14 @@ async function authenticateAndUpgradeWemos(request, socket, head, usernameHeader
 
         // If there's an existing Wemos connection for same deviceName, terminate it
         const existing = authenticatedWemos.get(deviceName);
-if (existing && existing.readyState === WebSocket.OPEN) {
-  console.log("Gracefully closing existing Wemos connection...");
-
-  setTimeout(() => {
-    try { 
-      existing.close(1000, "New Wemos session replacing old");
-    } catch (e) {}
-  }, 500); // allow handshake to complete
-}
+        if (existing && existing.readyState === WebSocket.OPEN) {
+            console.log("Gracefully closing existing Wemos connection...");
+            setTimeout(() => {
+              try { 
+                existing.close(1000, "New Wemos session replacing old");
+                } catch (e) {}
+            }, 500); // allow handshake to complete
+       }
 
 
         authenticatedWemos.set(deviceName, ws);
@@ -232,7 +231,7 @@ if (existing && existing.readyState === WebSocket.OPEN) {
         // flush queued messages
         flushQueue(ws);
 
-        wss.emit('connection', ws, request);
+        // wss.emit('connection', ws, request);
       });
     } catch (err) {
       console.log(`handleUpgrade error: ${err.message}`);
